@@ -1,0 +1,1425 @@
+import { SiteMapResponse } from '../../models/siteMapResponse';
+import { Topic } from '../../models/topic';
+import {
+    ASTUTE,
+    BRAND_ATTRIBUTES,
+    DESCRIPTION_ELLIPSIS,
+    SUPPORT_HUB_PREFIXES_NOT_FOR_BBT,
+    SUPPORT_HUB_PREFIXES_NOT_FOR_SITEMAP,
+    SUPPORT_HUB_REGEX,
+} from '../../support-constants';
+import siteMapService from '../site-map-service/site-map-service';
+import xss from 'xss';
+import { PlaceholderResponse } from '../../models/place-holder-response';
+import { TopicPage } from '../../models/topic-page';
+import { HttpsProxyAgent } from 'https-proxy-agent';
+import { SuggestedTopic } from '../../models/suggested-topic';
+import cacheService from '../../../services/cache-service/cache-service';
+import { CategoryPage } from '../../models/category-page';
+import { SubCategoryPage } from '../../models/sub-category-page';
+import slugify from 'slugify';
+import ServiceHandler from '../../../services/service-handler';
+import serverSideService from '../../../services/server-side-service/server-side-service';
+import HttpService from '../../../services/http-service/http-service';
+import { Category } from '../../models/category';
+import { CategoryValue } from '../../models/categoryValue';
+
+const httpsAgent = new HttpsProxyAgent(
+    process.env.http_proxy || 'http://internet.ford.com:83'
+);
+export interface AstuteCacheResponse {
+    [prefix: string]: Topic[];
+}
+export default class AstuteService {
+    private auth = {
+        username: process.env.REACT_APP_ASTUTE_USER_NAME || '',
+        password: process.env.REACT_APP_ASTUTE_USER_PASSWORD || '',
+    };
+    public async getTopicById(
+        category: string,
+        subCategory: string,
+        topicLabel: string,
+        languageRegionCode: string,
+        domain: string,
+        root: string,
+        brand: string
+    ): Promise<TopicPage> {
+        let topicPage: TopicPage = {
+            topicLabel: '',
+            topicHeading: '',
+            bodyWoHeading: '',
+            metaDescription: '',
+            hrefLangs: '',
+            canonical: '',
+            topicAbsoluteSeo: '',
+            topicId: 0,
+            sessionId: '',
+        };
+        try {
+            const sitemapTag = (BRAND_ATTRIBUTES as any)[brand].sitemap;
+            const siteMapData = await this.getSitemapDataFromCache(
+                languageRegionCode,
+                sitemapTag,
+                brand,
+                true
+            );
+            let topicPageCanonical = '';
+            let categorySubCategoryFound = '';
+            const topics = siteMapData.filter(topic => {
+                return (
+                    topicLabel === topic.topicLabelSeo ||
+                    topic.oldTopicLabels?.includes(topicLabel)
+                );
+            });
+            const topicFound = topics.filter(topic => {
+                topicPageCanonical = topic.topicAbsoluteSeo || '';
+                const topicSplit = topicPageCanonical?.split('/');
+                const canonicalCategory = topicSplit && topicSplit[1];
+                const canonicalSubCategory = topicSplit && topicSplit[2];
+                if (
+                    canonicalCategory === category ||
+                    canonicalSubCategory === subCategory
+                )
+                    categorySubCategoryFound = topic.topicAbsoluteSeo || '';
+
+                return (
+                    canonicalCategory === category &&
+                    canonicalSubCategory === subCategory &&
+                    topic.topicLabelSeo === topicLabel
+                );
+            });
+            if (!topicFound || topicFound.length === 0) {
+                topicPage.topicAbsoluteSeo = categorySubCategoryFound
+                    ? categorySubCategoryFound
+                    : topicPageCanonical;
+                return topicPage;
+            }
+
+            const sessionID = await this.getSessionIdForSearch(
+                languageRegionCode,
+                brand
+            );
+            const topicContent = await this.getTopicContentByTopicId(
+                topicFound[0],
+                siteMapData,
+                languageRegionCode,
+                root,
+                sessionID,
+                brand,
+                false
+            );
+            topicPage = topicContent || topicPage;
+            const translatedRoute = siteMapService
+                .getPathFromRouterConfigs(
+                    languageRegionCode,
+                    brand,
+                    'AstuteTopic',
+                    categorySubCategoryFound?.substring(1).split('/') || []
+                )
+                ?.concat(categorySubCategoryFound?.endsWith('/') ? '/' : '');
+
+            const currentRoot = root.substring(0, root.length - 1);
+            const link = `https://${domain}${currentRoot}${translatedRoute}`;
+            topicPage.bodyWoHeading = topicPage.bodyWoHeading?.replace(
+                SUPPORT_HUB_REGEX.HREF_HASH,
+                `href="${link}#`
+            );
+            topicPage.canonical = link;
+            topicPage.sessionId = sessionID;
+            return topicPage;
+        } catch (error) {
+            console.error(
+                `getTopicById - ${error} ${category} ${subCategory} ${topicLabel}`
+            );
+            throw new Error(`getTopicById - ${error}`);
+        }
+    }
+    public async getTopicContentByTopicId(
+        topic: Topic,
+        siteMapData: Topic[],
+        languageRegionCode: string,
+        root: string,
+        sessionID: string,
+        brand: string,
+        isSearch: boolean
+    ) {
+        const topicPage: TopicPage = {
+            topicLabel: '',
+            categoryName: '',
+            subCategoryName: '',
+            topicHeading: '',
+            bodyWoHeading: '',
+            metaDescription: '',
+            hrefLangs: '',
+            topicId: 0,
+        };
+        try {
+            topicPage.topicId = topic.topicId;
+            const topicSplit = topic.topicAbsoluteSeo?.split('/');
+            topicPage.topicLabel = topic.topicLabel;
+            topicPage.noIndex = topic.noIndex;
+            topic.categories?.forEach(category => {
+                if (
+                    topicSplit &&
+                    category.localizedCategoryNameSeo === topicSplit[1]
+                ) {
+                    topicPage.categoryName = category.localizedCategoryName;
+
+                    category.categoryValues.forEach(subCategory => {
+                        if (
+                            topicSplit &&
+                            subCategory.localizedCategoryValueSeo ===
+                                topicSplit[2]
+                        )
+                            topicPage.subCategoryName =
+                                subCategory.localizedCategoryValue;
+                    });
+                }
+            });
+            if (!isSearch) {
+                const topicseo = await Promise.all(
+                    this.getHrefLangsForSupportedMarkets(
+                        topicPage.topicId,
+                        brand
+                    )
+                );
+                topicPage.hrefLangs = topicseo && topicseo.join(' ');
+            }
+            const topicData = await this.astuteCallByTopicId(
+                topicPage.topicId,
+                languageRegionCode,
+                brand
+            );
+            if (topicData) {
+                topicData.response = await this.buildAdditionalTopicUrls(
+                    topicData,
+                    siteMapData,
+                    root,
+                    languageRegionCode,
+                    brand
+                );
+                const sanitizedHtml = this.sanitizeHtml(topicData.response);
+                const topicDataSeparated = this.getTopicBodyWoHeading(
+                    sanitizedHtml
+                );
+                topicPage.bodyWoHeading = topicDataSeparated.topicData;
+                topicPage.topicHeading = topicDataSeparated.topicHeading;
+                const metaDescription = await this.getTopicAttributes(
+                    brand,
+                    topicPage.topicId,
+                    languageRegionCode
+                );
+
+                topicPage.metaDescription = metaDescription?.Description
+                    ? metaDescription?.Description
+                    : this.getMetaDescription(topicPage.bodyWoHeading);
+
+                this.astuteSearch(
+                    topicPage.topicLabel || 'Default',
+                    sessionID,
+                    brand,
+                    topicPage.topicId
+                ).then(searchResult => {
+                    if (searchResult.status && searchResult.status != 1) {
+                        console.error(
+                            'Invalid status',
+                            searchResult.status,
+                            'for topic id & label',
+                            topicPage.topicId,
+                            topicPage.topicLabel
+                        );
+                    }
+                });
+            }
+            return topicPage;
+        } catch (error) {
+            console.error(
+                `getTopicContentByTopicId - ${error} ${topic.topicId}`
+            );
+            throw new Error(`getTopicContentByTopicId - ${error}`);
+        }
+    }
+    public async buildAdditionalTopicUrls(
+        topicData: PlaceholderResponse,
+        siteMapData: Topic[],
+        root: string,
+        languageRegionCode: string,
+        brand: string
+    ): Promise<string> {
+        let markup = topicData.response;
+
+        topicData.embeddedContents.forEach(content => {
+            if (content.type === 'TOPIC') {
+                const topic = siteMapData.find(
+                    topic => topic.topicId.toString() === content.contentId
+                );
+                const currentRoot = root.substring(0, root.length - 1);
+                const url = topic
+                    ? `${currentRoot}${siteMapService
+                          .getPathFromRouterConfigs(
+                              languageRegionCode,
+                              brand,
+                              'AstuteTopic',
+                              topic.topicAbsoluteSeo?.substring(1).split('/') ||
+                                  []
+                          )
+                          ?.concat(
+                              topic.topicAbsoluteSeo?.endsWith('/') ? '/' : ''
+                          )}`
+                    : `${currentRoot}${siteMapService.getPathFromRouterConfigs(
+                          languageRegionCode,
+                          brand,
+                          'AstuteSearch',
+                          [content.text]
+                      )}`;
+                const snippet = `<a href="${url}">${content.text}</a>`;
+                markup = markup.replace(content.snippet, snippet);
+            }
+        });
+        return markup;
+    }
+    private sanitizeString(source: string, languageCode: string) {
+        return slugify(
+            source.replace(
+                SUPPORT_HUB_REGEX.COPYRIGHTS_TRADE_REGISTERED_MARKS,
+                ''
+            ),
+            {
+                locale: languageCode,
+                lower: true,
+            }
+        )
+            .replace(SUPPORT_HUB_REGEX.PERIOD, '-')
+            .replace(SUPPORT_HUB_REGEX.INVALID_CHARS, '');
+    }
+    public sanitizeHtml(rawHtml: string): string {
+        const dangerouslySetInnerHTML = xss(rawHtml, {
+            onIgnoreTag(tag, html) {
+                if (ASTUTE.WHITELIST_XSS_MARKUP.includes(tag)) {
+                    return html;
+                }
+                return '';
+            },
+            onIgnoreTagAttr: function(tag, name, value) {
+                if (ASTUTE.WHITELIST_XSS_ATTRIBUTES.includes(name)) {
+                    return name + '="' + value + '"';
+                }
+            },
+        });
+        return dangerouslySetInnerHTML;
+    }
+    public getMetaDescription(topicData: string): string {
+        const metaDescription = topicData
+            .replace(SUPPORT_HUB_REGEX.ALL_MARKUP_TAGS, '')
+            .replace(SUPPORT_HUB_REGEX.FIND_ALL_TABS_NEW_LINE, '')
+            .replace(SUPPORT_HUB_REGEX.NON_BREAKING_SPACE, ' ')
+            .replace(SUPPORT_HUB_REGEX.FIND_FIRST_260_CHARS, '$1')
+            .trim()
+            .concat(DESCRIPTION_ELLIPSIS);
+        return metaDescription;
+    }
+    public getTopicBodyWoHeading(topicData: string) {
+        const astuteData = topicData;
+        const markupTopicHeading =
+            astuteData.indexOf(`<${ASTUTE.HEADING_TAG}>`) >= 0
+                ? astuteData.substring(
+                      astuteData.indexOf(`<${ASTUTE.HEADING_TAG}>`),
+                      astuteData.indexOf(`</${ASTUTE.HEADING_TAG}>`)
+                  )
+                : astuteData.substring(
+                      astuteData.indexOf('<h4>'),
+                      astuteData.indexOf('</h4>')
+                  );
+
+        return {
+            topicHeading: markupTopicHeading,
+            topicData: astuteData.replace(markupTopicHeading, '').trim(),
+        };
+    }
+    private redisCache = (
+        prefix: string,
+        supportedMarket: string,
+        brand: string
+    ) => {
+        return cacheService.getFromRedis(
+            ASTUTE.SITE_MAP_KEY_PREFIX + prefix + supportedMarket + '-' + brand
+        );
+    };
+    public async getSitemapDataFromRedisCache(
+        supportedMarket: string,
+        prefixes: string[],
+        brand: string
+    ): Promise<Topic[]> {
+        const topics: Topic[][] = [];
+        const sitemapTag = (BRAND_ATTRIBUTES as any)[brand].sitemap;
+        const bbtTag = (BRAND_ATTRIBUTES as any)[brand].bbt;
+        let redisCacheResponse = await Promise.all(
+            prefixes.map(async prefix => {
+                return await this.redisCache(prefix, supportedMarket, brand);
+            })
+        );
+        const prefixesArrToExclude =
+            prefixes === sitemapTag
+                ? SUPPORT_HUB_PREFIXES_NOT_FOR_SITEMAP
+                : SUPPORT_HUB_PREFIXES_NOT_FOR_BBT;
+
+        if (prefixes === sitemapTag || prefixes === bbtTag) {
+            let arrAb = await Promise.all(
+                prefixesArrToExclude.map(async prefix => {
+                    return await this.redisCache(
+                        prefix,
+                        supportedMarket,
+                        brand
+                    );
+                })
+            );
+            arrAb = arrAb.flat();
+            const abTopics: any = {};
+            arrAb.forEach(ab => {
+                abTopics[ab && ab.topicId] = true;
+            });
+
+            redisCacheResponse = redisCacheResponse.map(arrAf => {
+                return arrAf.filter((af: { topicId: any }) => {
+                    return !abTopics[af.topicId];
+                });
+            });
+        }
+
+        if (redisCacheResponse) {
+            redisCacheResponse.forEach(resp => {
+                topics.push(resp);
+            });
+        }
+        return topics.flat();
+    }
+    public async getSitemapDataFromCache(
+        supportedMarket: string,
+        prefixes: string[],
+        brand: string,
+        skipSitemapCheck?: boolean
+    ): Promise<Topic[]> {
+        const topics: Topic[][] = [];
+        let cacheDataForPrefixes: Topic[][] = [];
+        const redisCacheResponse = await this.getAstuteFromCacheForRegion(
+            supportedMarket,
+            brand
+        );
+        prefixes.forEach(prefix => {
+            redisCacheResponse.forEach(
+                cacheData =>
+                    cacheData[prefix] &&
+                    cacheDataForPrefixes.push(cacheData[prefix])
+            );
+        });
+        const sitemapTag = (BRAND_ATTRIBUTES as any)[brand].sitemap;
+        const bbtTag = (BRAND_ATTRIBUTES as any)[brand].bbt;
+        const prefixesArrToExclude =
+            prefixes === sitemapTag
+                ? SUPPORT_HUB_PREFIXES_NOT_FOR_SITEMAP
+                : SUPPORT_HUB_PREFIXES_NOT_FOR_BBT;
+        if (prefixes === sitemapTag || prefixes === bbtTag) {
+            let arrAb: any[] = [];
+            prefixesArrToExclude.forEach(prefix => {
+                redisCacheResponse.forEach(
+                    cacheData =>
+                        cacheData[prefix] && arrAb.push(cacheData[prefix])
+                );
+            });
+
+            arrAb = arrAb && arrAb.flat();
+            const abTopics: any = {};
+            arrAb.forEach(ab => {
+                if (ab) abTopics[ab.topicId] = true;
+            });
+
+            cacheDataForPrefixes =
+                prefixes === sitemapTag
+                    ? cacheDataForPrefixes.map(arrAf => {
+                          return arrAf?.map(af => {
+                              af.noIndex = abTopics[af.topicId] ? true : false;
+                              return af;
+                          });
+                      })
+                    : cacheDataForPrefixes;
+
+            if (!skipSitemapCheck)
+                cacheDataForPrefixes = cacheDataForPrefixes.map(arrAf => {
+                    return arrAf?.filter(af => {
+                        return !abTopics[af.topicId];
+                    });
+                });
+        }
+
+        if (cacheDataForPrefixes) {
+            cacheDataForPrefixes.forEach(resp => {
+                resp && topics.push(resp);
+            });
+        }
+        return topics.flat();
+    }
+    public cacheSiteMap() {
+        ASTUTE.SUPPORTED_MARKETS.forEach(market => {
+            ASTUTE.BRANDS.forEach(brand => {
+                const marketDetails = siteMapService
+                    .getMarketDetails()
+                    .find(
+                        configMarket =>
+                            configMarket.languageRegionCode === market &&
+                            configMarket.brand === brand
+                    );
+                const cachePrefixes = (BRAND_ATTRIBUTES as any)[brand].cache;
+                marketDetails &&
+                    cachePrefixes.forEach(async (prefix: string) => {
+                        await this.cacheSupportedMarket(market, prefix, brand);
+                    });
+            });
+        });
+    }
+    public async getAstuteCacheData(supportedMarket: string, brand: string) {
+        const cachePrefixes = (BRAND_ATTRIBUTES as any)[brand].cache;
+        return await Promise.all(
+            cachePrefixes.map(async (prefix: string) => {
+                return {
+                    [prefix]: await cacheService.getFromRedis(
+                        ASTUTE.SITE_MAP_KEY_PREFIX +
+                            prefix +
+                            supportedMarket +
+                            '-' +
+                            brand
+                    ),
+                };
+            })
+        );
+    }
+    public async cacheSupportedMarket(
+        supportedMarket: string,
+        supportHubPrefix: string,
+        brand: string
+    ) {
+        let astuteSiteMapPageNumber = 0;
+        const filteredTopics: Topic[] = [];
+        const firstPageOfSiteMap = await this.getSiteMap(
+            astuteSiteMapPageNumber,
+            supportedMarket,
+            brand
+        );
+        const languageCode = supportedMarket.split('-')[0];
+        const siteMaps: SiteMapResponse[] = [firstPageOfSiteMap];
+        const sitemapTag = (BRAND_ATTRIBUTES as any)[brand].sitemap;
+        while (astuteSiteMapPageNumber < firstPageOfSiteMap.totalPages) {
+            astuteSiteMapPageNumber++;
+            siteMaps.push(
+                await this.getSiteMap(
+                    astuteSiteMapPageNumber,
+                    supportedMarket,
+                    brand
+                )
+            );
+        }
+        const cachedSitemap = await this.getSitemapDataFromCache(
+            supportedMarket,
+            sitemapTag,
+            brand,
+            true
+        );
+        siteMaps.forEach(sitemap => {
+            sitemap.topics?.forEach(topic => {
+                const filteredCategories = topic.categories?.filter(category =>
+                    category.categoryName.startsWith(supportHubPrefix)
+                );
+                topic.topicLabel = topic.topicLabel.replace(
+                    SUPPORT_HUB_REGEX.AMPERSAND,
+                    '&'
+                );
+                topic.topicLabelSeo = this.sanitizeString(
+                    topic.topicLabel,
+                    languageCode
+                );
+                const cachedTopic = cachedSitemap.find(
+                    top => top.topicId === topic.topicId
+                );
+                topic.oldTopicLabels = !cachedTopic?.oldTopicLabels
+                    ? []
+                    : cachedTopic?.oldTopicLabels;
+                if (
+                    topic.oldTopicLabels &&
+                    (topic.oldTopicLabels.length === 0 ||
+                        !topic.oldTopicLabels.includes(topic.topicLabelSeo))
+                )
+                    topic.oldTopicLabels.push(topic.topicLabelSeo);
+                filteredCategories?.forEach(category => {
+                    category.categoryName = category.categoryName.replace(
+                        supportHubPrefix,
+                        ''
+                    );
+                    category.localizedCategoryName = category.localizedCategoryName.replace(
+                        supportHubPrefix,
+                        ''
+                    );
+                    category.localizedCategoryNameSeo = this.sanitizeString(
+                        category.localizedCategoryName,
+                        languageCode
+                    );
+
+                    category.categoryValues.forEach(subCat => {
+                        subCat.localizedCategoryValueSeo = this.sanitizeString(
+                            subCat.localizedCategoryValue,
+                            languageCode
+                        );
+                        subCat.categoryValueAbsoluteSeo = `/${category.localizedCategoryNameSeo}/${subCat.localizedCategoryValueSeo}/`;
+                    });
+                    category.categoryAbsoluteSeo = `/${category.localizedCategoryNameSeo}/`;
+                    topic.topicAbsoluteSeo = `/${category.localizedCategoryNameSeo}/${category.categoryValues[0]?.localizedCategoryValueSeo}/${topic.topicLabelSeo}`;
+                    topic.topicAbsoluteSeo = ASTUTE.SUPPORTED_MARKETS_WITH_ENDING_SLASH.includes(
+                        supportedMarket
+                    )
+                        ? topic?.topicAbsoluteSeo?.concat('/')
+                        : topic.topicAbsoluteSeo;
+                    const topicCopy = {
+                        topicId: topic.topicId,
+                        topicName: topic.topicName,
+                        topicLabel: topic.topicLabel,
+                        topicAbsoluteSeo: topic.topicAbsoluteSeo,
+                        topicLabelSeo: topic.topicLabelSeo,
+                        oldTopicLabels: topic.oldTopicLabels,
+                        categories: [category],
+                    };
+                    filteredTopics.push(topicCopy);
+                });
+            });
+        });
+        cacheService.putInRedis(
+            ASTUTE.SITE_MAP_KEY_PREFIX +
+                supportHubPrefix +
+                supportedMarket +
+                '-' +
+                brand,
+            filteredTopics,
+            ASTUTE.SITE_MAP_CACHE_EXP_SEC
+        );
+    }
+    public getHrefLangsForSupportedMarkets(topicId: number, brand: string) {
+        const sitemapTag = (BRAND_ATTRIBUTES as any)[brand].sitemap;
+        try {
+            return ASTUTE.SUPPORTED_MARKETS.map(async market => {
+                const topic = await this.getTopicFromCache(
+                    market,
+                    brand,
+                    sitemapTag,
+                    topicId
+                );
+                const baseUrl = siteMapService.getBaseUrl(market, brand);
+                const howTosTopicUrl = siteMapService
+                    .getPathFromRouterConfigs(
+                        market,
+                        brand,
+                        'AstuteTopic',
+                        topic?.topicAbsoluteSeo?.substring(1).split('/') || []
+                    )
+                    ?.concat(topic?.topicAbsoluteSeo?.endsWith('/') ? '/' : '');
+                const url =
+                    howTosTopicUrl &&
+                    `${baseUrl.domain}${baseUrl.root}${howTosTopicUrl}`;
+                const hrefLink =
+                    topic &&
+                    url &&
+                    `<link rel="alternate" hreflang="${market}" href="${url}"/>`;
+                return hrefLink;
+            });
+        } catch (error) {
+            console.error(
+                `getHrefLangsForSupportedMarkets - ${error} ${topicId}`
+            );
+            throw new Error(`getHrefLangsForSupportedMarkets - ${error}`);
+        }
+    }
+    public async getTopicFromCache(
+        market: string,
+        brand: string,
+        sitemapTag: string[],
+        topicId: number
+    ) {
+        return (
+            await this.getSitemapDataFromCache(market, sitemapTag, brand, true)
+        ).find(topic => topic.topicId === topicId);
+    }
+    public async getHrefLangsForCategory(
+        categoryId: number,
+        brand: string
+    ): Promise<string[]> {
+        const sitemapTag = (BRAND_ATTRIBUTES as any)[brand].sitemap;
+        try {
+            return await Promise.all(
+                ASTUTE.SUPPORTED_MARKETS.map(async market => {
+                    const category = await this.getCategoryFromCache(
+                        market,
+                        brand,
+                        sitemapTag,
+                        categoryId
+                    );
+                    const baseUrl = siteMapService.getBaseUrl(market, brand);
+                    const howTosCategoryUrl = siteMapService
+                        .getPathFromRouterConfigs(
+                            market,
+                            brand,
+                            'CategoryPageView',
+                            category?.categoryAbsoluteSeo
+                                ?.substring(1)
+                                .split('/') || []
+                        )
+                        ?.concat(
+                            category?.categoryAbsoluteSeo?.endsWith('/')
+                                ? '/'
+                                : ''
+                        );
+                    const url =
+                        howTosCategoryUrl &&
+                        `${baseUrl.domain}${baseUrl.root}${howTosCategoryUrl}`;
+                    const hrefLink =
+                        category.categoryName &&
+                        url &&
+                        `<link rel="alternate" hreflang="${market}" href="${url}"/>`;
+                    return hrefLink || '';
+                })
+            );
+        } catch (error) {
+            console.error(`getHrefLangsForCategory - ${error} ${categoryId}`);
+            throw new Error(`getHrefLangsForCategory - ${error}`);
+        }
+    }
+    public async getCategoryFromCache(
+        market: string,
+        brand: string,
+        sitemapTag: string[],
+        categoryId: number
+    ) {
+        let category: Category = {
+            categoryId: 0,
+            categoryName: '',
+            localizedCategoryName: '',
+            categoryValues: [],
+        };
+        const sitemap = await this.getSitemapDataFromCache(
+            market,
+            sitemapTag,
+            brand,
+            true
+        );
+        sitemap.forEach(topic => {
+            const categories = topic.categories?.find(
+                cat => cat.categoryId === categoryId
+            );
+            if (categories) category = categories;
+        });
+        return category;
+    }
+    public async getHrefLangsForSubCategory(
+        subCategoryId: number,
+        brand: string
+    ): Promise<string[]> {
+        const sitemapTag = (BRAND_ATTRIBUTES as any)[brand].sitemap;
+        try {
+            return await Promise.all(
+                ASTUTE.SUPPORTED_MARKETS.map(async market => {
+                    const subCategory = await this.getSubCategoryFromCache(
+                        market,
+                        brand,
+                        sitemapTag,
+                        subCategoryId
+                    );
+                    const baseUrl = siteMapService.getBaseUrl(market, brand);
+                    const howTosSubCategoryUrl = siteMapService
+                        .getPathFromRouterConfigs(
+                            market,
+                            brand,
+                            'SubCategoryPageView',
+                            subCategory?.categoryValueAbsoluteSeo
+                                ?.substring(1)
+                                .split('/') || []
+                        )
+                        ?.concat(
+                            subCategory?.categoryValueAbsoluteSeo?.endsWith('/')
+                                ? '/'
+                                : ''
+                        );
+                    const url =
+                        howTosSubCategoryUrl &&
+                        `${baseUrl.domain}${baseUrl.root}${howTosSubCategoryUrl}`;
+                    const hrefLink =
+                        subCategory.categoryValue &&
+                        url &&
+                        `<link rel="alternate" hreflang="${market}" href="${url}"/>`;
+                    return hrefLink || '';
+                })
+            );
+        } catch (error) {
+            console.error(
+                `getHrefLangsForSubCategory - ${error} ${subCategoryId}`
+            );
+            throw new Error(`getHrefLangsForSubCategory - ${error}`);
+        }
+    }
+    public async getSubCategoryFromCache(
+        market: string,
+        brand: string,
+        sitemapTag: string[],
+        subCategoryId: number
+    ) {
+        let subCategory: CategoryValue = {
+            categoryValueId: 0,
+            categoryValue: '',
+            localizedCategoryValue: '',
+        };
+        const sitemap = await this.getSitemapDataFromCache(
+            market,
+            sitemapTag,
+            brand,
+            true
+        );
+        sitemap.forEach(topic => {
+            topic.categories?.forEach(cat => {
+                const subCategories = cat.categoryValues.find(
+                    subcat => subcat.categoryValueId === subCategoryId
+                );
+                if (subCategories) subCategory = subCategories;
+            });
+        });
+        return subCategory;
+    }
+    public async getSearchResults(
+        searchterm: string,
+        languageRegionCode: string,
+        domain: string,
+        root: string,
+        brand: string
+    ) {
+        const topicPage: TopicPage = {
+            topicLabel: '',
+            topicHeading: '',
+            categoryName: '',
+            subCategoryName: '',
+            bodyWoHeading: '',
+            metaDescription: '',
+            hrefLangs: '',
+            relatedTopics: '',
+            canonical: '',
+            topicId: 0,
+            categoryId: 0,
+            sessionId: '',
+        };
+        try {
+            const sitemapTag = (BRAND_ATTRIBUTES as any)[brand].sitemap;
+            const siteMapData = await this.getSitemapDataFromCache(
+                languageRegionCode,
+                sitemapTag,
+                brand,
+                true
+            );
+            const sessionID = await this.getSessionIdForSearch(
+                languageRegionCode,
+                brand
+            );
+            const searchResults = await this.astuteSearch(
+                searchterm,
+                sessionID,
+                brand
+            );
+            topicPage.topicId =
+                searchResults.intent && parseInt(searchResults.intent);
+            const topic = siteMapData.find(
+                topic => topic.topicId === topicPage.topicId
+            );
+            topicPage.categoryId =
+                topic && topic.categories && topic?.categories[0]?.categoryId;
+            if (topic) {
+                const topicContentById = await this.getTopicContentByTopicId(
+                    topic,
+                    siteMapData,
+                    languageRegionCode,
+                    root,
+                    sessionID,
+                    brand,
+                    true
+                );
+                topicPage.sessionId = sessionID;
+                topicPage.topicHeading = topicContentById?.topicHeading;
+                topicPage.bodyWoHeading = topicContentById?.bodyWoHeading || '';
+                topicPage.topicLabel = topicContentById?.topicLabel;
+                topicPage.categoryName = topicContentById?.categoryName;
+                topicPage.subCategoryName = topicContentById?.subCategoryName;
+            }
+            const suggestedTopics =
+                searchResults.suggestedTopics &&
+                (await this.buildSuggestedTopics(
+                    searchResults.suggestedTopics,
+                    siteMapData,
+                    root,
+                    languageRegionCode,
+                    brand
+                ));
+            if (
+                !topicPage.bodyWoHeading ||
+                topicPage.bodyWoHeading
+                    .replace(SUPPORT_HUB_REGEX.FIND_ALL_TABS_NEW_LINE, '')
+                    .replace(SUPPORT_HUB_REGEX.ALL_MARKUP_TAGS, '')
+                    .replace(SUPPORT_HUB_REGEX.NON_BREAKING_SPACE, '')
+                    .length === 0
+            ) {
+                topicPage.bodyWoHeading = this.sanitizeHtml(
+                    searchResults.utterance
+                );
+            }
+            const translatedRoute = siteMapService.getPathFromRouterConfigs(
+                languageRegionCode,
+                brand,
+                'AstuteSearch',
+                [searchterm]
+            );
+
+            const currentRoot = root.substring(0, root.length - 1);
+            const link = `https://${domain}${currentRoot}${translatedRoute}`;
+            topicPage.bodyWoHeading = topicPage.bodyWoHeading?.replace(
+                SUPPORT_HUB_REGEX.HREF_HASH,
+                `href="${link}#`
+            );
+
+            const metaDescription = await this.getTopicAttributes(
+                brand,
+                topicPage.topicId,
+                languageRegionCode
+            );
+            topicPage.metaDescription = metaDescription?.Description
+                ? metaDescription?.Description
+                : this.getMetaDescription(topicPage.bodyWoHeading) || '';
+
+            if (suggestedTopics)
+                topicPage.relatedTopics = suggestedTopics.join(' ');
+            topicPage.canonical = `https://${domain}${currentRoot}/`;
+        } catch (error) {
+            console.error(`getSearchResults - ${error} ${searchterm}`);
+            throw new Error(`getSearchResults - ${error} ${searchterm}`);
+        }
+        return topicPage;
+    }
+    public async buildSuggestedTopics(
+        suggestedTopics: SuggestedTopic[],
+        siteMapData: Topic[],
+        root: string,
+        languageRegionCode: string,
+        brand: string
+    ) {
+        const markup: string[] = [];
+
+        suggestedTopics.forEach(suggestedTopic => {
+            const topic = siteMapData.filter(
+                topic => topic.topicId.toString() === suggestedTopic.intent
+            );
+            const currentRoot = root.substring(0, root.length - 1);
+            const url =
+                topic && topic[0]
+                    ? `${currentRoot}${siteMapService
+                          .getPathFromRouterConfigs(
+                              languageRegionCode,
+                              brand,
+                              'AstuteTopic',
+                              topic[0].topicAbsoluteSeo
+                                  ?.substring(1)
+                                  .split('/') || []
+                          )
+                          ?.concat(
+                              topic[0].topicAbsoluteSeo?.endsWith('/')
+                                  ? '/'
+                                  : ''
+                          )}`
+                    : `${currentRoot}${siteMapService.getPathFromRouterConfigs(
+                          languageRegionCode,
+                          brand,
+                          'AstuteSearch',
+                          [suggestedTopic.text]
+                      )}`;
+
+            const snippet = `<a href="${url}">${suggestedTopic.text}</a><br>`;
+            markup.push(snippet);
+        });
+        return markup;
+    }
+    public async getAstuteArticlesFromCache(market: string, brand: string) {
+        const sitemapTag = (BRAND_ATTRIBUTES as any)[brand].sitemap;
+        const categories = await this.getAllCategories(
+            market,
+            sitemapTag,
+            brand,
+            true
+        );
+        return categories.map(cat => {
+            return {
+                categoryName: cat.categoryName,
+                categoryId: cat.categoryId,
+                subCategories: cat.subCategories.map(subcat => {
+                    return {
+                        subCategoryName: subcat.subCategoryName,
+                        subCategoryId: subcat.subCategoryId,
+                        topics:
+                            subcat.allTopics &&
+                            subcat.allTopics.map(topic => {
+                                return {
+                                    topicLabel: topic.topicLabel,
+                                    topicAbsoluteSeo: topic.topicAbsoluteSeo,
+                                    topicId: topic.topicId,
+                                    topicPreview: 'Coming soon...',
+                                    oldTopicLabels: topic.oldTopicLabels,
+                                };
+                            }),
+                    };
+                }),
+            };
+        });
+    }
+    public async getAllCategories(
+        languageRegionCode: string,
+        prefixes: string[],
+        brand: string,
+        skipSitemapCheck?: boolean,
+        skipCategory?: boolean
+    ) {
+        const categories: CategoryPage[] = [];
+        const subCategories: SubCategoryPage[] = [];
+        try {
+            const siteMapData = await this.getSitemapDataFromCache(
+                languageRegionCode,
+                prefixes,
+                brand,
+                skipSitemapCheck
+            );
+
+            siteMapData.forEach(topic => {
+                const topicWoCategories = {
+                    topicId: topic.topicId,
+                    topicName: topic.topicName || '',
+                    topicLabel: topic.topicLabel,
+                    topicAbsoluteSeo: topic.topicAbsoluteSeo || '',
+                    topicLabelSeo: topic.topicLabelSeo || '',
+                    oldTopicLabels: topic.oldTopicLabels || [],
+                };
+                topic.categories?.forEach(categ => {
+                    categ.categoryValues.forEach(categVal => {
+                        const topicSplit = topic.topicAbsoluteSeo?.split('/');
+
+                        const subCategory: SubCategoryPage = {
+                            subCategorySeo:
+                                categVal.localizedCategoryValueSeo || '',
+                            subCategoryAbsoluteSeo:
+                                siteMapService
+                                    .getPathFromRouterConfigs(
+                                        languageRegionCode,
+                                        brand,
+                                        'SubCategoryPageView',
+                                        categVal.categoryValueAbsoluteSeo
+                                            ?.substring(1)
+                                            .split('/') || []
+                                    )
+                                    ?.concat(
+                                        categVal.categoryValueAbsoluteSeo?.endsWith(
+                                            '/'
+                                        )
+                                            ? '/'
+                                            : ''
+                                    ) || '',
+                            subCategoryId: categVal.categoryValueId,
+                            subCategoryName: categVal.localizedCategoryValue,
+                            allTopics: [],
+                        };
+
+                        const existingSubCat = subCategories.find(
+                            subcat =>
+                                subcat.subCategoryId ===
+                                subCategory.subCategoryId
+                        );
+
+                        if (!existingSubCat) {
+                            if (
+                                topicSplit &&
+                                subCategory.subCategorySeo === topicSplit[2]
+                            ) {
+                                topicWoCategories.topicAbsoluteSeo =
+                                    siteMapService
+                                        .getPathFromRouterConfigs(
+                                            languageRegionCode,
+                                            brand,
+                                            'AstuteTopic',
+                                            topic.topicAbsoluteSeo
+                                                ?.substring(1)
+                                                .split('/') || []
+                                        )
+                                        ?.concat(
+                                            topic.topicAbsoluteSeo?.endsWith(
+                                                '/'
+                                            )
+                                                ? '/'
+                                                : ''
+                                        ) || '';
+                                subCategory.allTopics &&
+                                    subCategory.allTopics.push(
+                                        topicWoCategories
+                                    );
+                            }
+                            subCategories.push(subCategory);
+                        } else if (
+                            topicSplit &&
+                            existingSubCat.subCategorySeo === topicSplit[2]
+                        ) {
+                            topicWoCategories.topicAbsoluteSeo =
+                                siteMapService
+                                    .getPathFromRouterConfigs(
+                                        languageRegionCode,
+                                        brand,
+                                        'AstuteTopic',
+                                        topic.topicAbsoluteSeo
+                                            ?.substring(1)
+                                            .split('/') || []
+                                    )
+                                    ?.concat(
+                                        topic.topicAbsoluteSeo?.endsWith('/')
+                                            ? '/'
+                                            : ''
+                                    ) || '';
+                            existingSubCat.allTopics &&
+                                existingSubCat.allTopics.push(
+                                    topicWoCategories
+                                );
+                        }
+                        const categPage: CategoryPage = {
+                            categoryId: categ.categoryId,
+                            categoryName: categ.localizedCategoryName,
+                            subCategories: [],
+                            categorySeo: categ.localizedCategoryNameSeo,
+                            categoryAbsoluteSeo:
+                                siteMapService
+                                    .getPathFromRouterConfigs(
+                                        languageRegionCode,
+                                        brand,
+                                        'CategoryPageView',
+                                        categ.categoryAbsoluteSeo
+                                            ?.substring(1)
+                                            .split('/') || []
+                                    )
+                                    ?.concat(
+                                        categ.categoryAbsoluteSeo?.endsWith('/')
+                                            ? '/'
+                                            : ''
+                                    ) || '',
+                        };
+                        const existingCat = categories.find(
+                            cat => cat.categoryId === categ.categoryId
+                        );
+                        const existingSubCatInCat = categories.find(cat => {
+                            return cat.subCategories.find(subCat => {
+                                return (
+                                    subCat.subCategoryId ===
+                                    subCategory.subCategoryId
+                                );
+                            });
+                        });
+
+                        if (!existingCat) {
+                            categPage.subCategories.push(subCategory);
+                            categories.push(categPage);
+                        } else if (!existingSubCatInCat)
+                            existingCat.subCategories.push(subCategory);
+                    });
+                });
+            });
+            categories.forEach(categ => {
+                categ.subCategories = [...categ.subCategories].sort((a, b) =>
+                    a.subCategoryName
+                        .toLocaleUpperCase()
+                        .localeCompare(b.subCategoryName.toLocaleUpperCase())
+                );
+                categ.subCategories.forEach(
+                    subcat =>
+                        (subcat.allTopics = subcat.allTopics?.sort((a, b) =>
+                            a.topicLabel
+                                .toLocaleUpperCase()
+                                .localeCompare(b.topicLabel.toLocaleUpperCase())
+                        ))
+                );
+            });
+        } catch (error) {
+            console.error(error);
+            throw new Error(`getAllCategories: ${error}`);
+        }
+        const filteredCategories = skipCategory
+            ? categories.filter(
+                  categ =>
+                      !(BRAND_ATTRIBUTES as any)[brand].excludeCatId.includes(
+                          categ.categoryId
+                      )
+              )
+            : categories;
+
+        return filteredCategories.sort((a, b) =>
+            a.categoryName
+                .toLocaleUpperCase()
+                .localeCompare(b.categoryName.toLocaleUpperCase())
+        );
+    }
+    public async getAstuteFromCacheForRegion(
+        market: string,
+        brand: string
+    ): Promise<AstuteCacheResponse[]> {
+        if (serverSideService.isServerSide()) {
+            return Promise.resolve(
+                await this.getAstuteCacheData(market, brand)
+            ) as Promise<AstuteCacheResponse[]>;
+        } else {
+            const params = {
+                market: market,
+                brand: brand,
+            };
+
+            const appConfig = ServiceHandler.AppConfigurationService.getAppConfiguration();
+
+            const currentRoot =
+                appConfig?.root && appConfig.root !== `/${brand}/${market}/`
+                    ? appConfig?.root.substring(0, appConfig?.root.length - 1)
+                    : '';
+
+            const basePath = process.env.REACT_APP_REDIS_CACHE_URL
+                ? process.env.REACT_APP_REDIS_CACHE_URL
+                : currentRoot;
+
+            return await HttpService.get<AstuteCacheResponse[]>(
+                `${basePath}/redis/getAstuteFromCache`,
+                true,
+                { httpsAgent, params, proxy: false }
+            )
+                .then(result => {
+                    return result.data;
+                })
+                .catch(e => {
+                    console.error(e.message);
+                    return e.message;
+                });
+        }
+    }
+    public async astuteCallByTopicId(
+        topicId: number,
+        languageRegionCode: string,
+        brand: string
+    ) {
+        languageRegionCode =
+            languageRegionCode === 'fr-lu' ? 'fr-be' : languageRegionCode;
+        const touchPointId = (BRAND_ATTRIBUTES as any)[brand].touchpoint;
+        const params = {
+            privilegedArea: ASTUTE.PRIVILEGED_AREA_WEB_ID,
+        };
+        return await HttpService.get(
+            `https://${ASTUTE.BASE_URL}/${ASTUTE.KB_ID}/intents/${topicId}/locale/${languageRegionCode}/touchpoints/${touchPointId}/response`,
+            false,
+            {
+                httpsAgent,
+                auth: this.auth,
+                params,
+                proxy: false,
+            }
+        )
+            .then(response => {
+                return response.data;
+            })
+            .catch(e => {
+                console.error(
+                    `astuteCallByTopicId - Astute Upstream Failure - ${e.message} for topic Id - ${topicId}`
+                );
+                throw new Error(
+                    `astuteCallByTopicId - Astute Upstream Failure - ${e.message} for topic Id - ${topicId}`
+                );
+            });
+    }
+    public async getSiteMap(
+        pageNumber: number,
+        supportedMarket: string,
+        brand: string
+    ) {
+        supportedMarket =
+            supportedMarket === 'fr-lu' ? 'fr-be' : supportedMarket;
+        const touchPointId = (BRAND_ATTRIBUTES as any)[brand].touchpoint;
+        const params = {
+            touchpoints: touchPointId,
+        };
+        return await HttpService.get(
+            `https://${ASTUTE.BASE_URL}/${ASTUTE.KB_ID}/intents/locale/${supportedMarket}/page/${pageNumber}`,
+            false,
+            {
+                httpsAgent,
+                auth: this.auth,
+                params,
+                proxy: false,
+            }
+        )
+            .then(response => {
+                return response.data;
+            })
+            .catch(e => {
+                console.error(
+                    `getSiteMap - Astute Upstream Failure - ${e.message} for supportedMarket - ${supportedMarket}`
+                );
+                throw new Error(
+                    `getSiteMap - Astute Upstream Failure - ${e.message} for supportedMarket - ${supportedMarket}`
+                );
+            });
+    }
+    public async getSuggestedResults(
+        currentSearchTerm: string,
+        sessionID: string,
+        brand: string
+    ) {
+        const searchUrl = (BRAND_ATTRIBUTES as any)[brand].searchUrl;
+
+        if (sessionID) {
+            return await HttpService.post(
+                searchUrl.https + '/autocomplete',
+                {
+                    sessionID,
+                    utterance: currentSearchTerm,
+                    suggestionCount: 10,
+                },
+                { httpsAgent, auth: this.auth, proxy: false }
+            )
+                .then(result => {
+                    let suggestions = result.data.suggestions;
+                    suggestions = suggestions.map((item: string) =>
+                        item.replace(SUPPORT_HUB_REGEX.ALL_MARKUP_TAGS, '')
+                    );
+                    return suggestions;
+                })
+                .catch(e => {
+                    console.error(
+                        `Get suggested results failure, couldn't get autocomplete: ${e.message}`
+                    );
+                    throw new Error(
+                        `Get suggested results failure, couldn't get autocomplete: ${e.message}`
+                    );
+                });
+        }
+    }
+    public async getSessionIdForSearch(
+        languageRegionCode: string,
+        brand: string
+    ) {
+        languageRegionCode =
+            languageRegionCode === 'fr-lu' ? 'fr-be' : languageRegionCode;
+        const searchUrl = (BRAND_ATTRIBUTES as any)[brand].searchUrl;
+        return await HttpService.post(
+            searchUrl.https + '/init',
+            {
+                market: languageRegionCode,
+            },
+            { httpsAgent, auth: this.auth, proxy: false }
+        )
+            .then(value => {
+                return value.data.sessionID;
+            })
+
+            .catch(e => {
+                console.error(
+                    `getSessionIdForSearch - Astute Upstream Failure - ${e.message} for supportedMarket - ${languageRegionCode}`
+                );
+            });
+    }
+    public async astuteSearch(
+        currentSearchTerm: string,
+        sessionID: string,
+        brand: string,
+        questionID?: number
+    ) {
+        const searchUrl = (BRAND_ATTRIBUTES as any)[brand].searchUrl;
+        if (sessionID) {
+            return await HttpService.post(
+                searchUrl.https + '/ask',
+                {
+                    sessionID,
+                    requestUtterance: currentSearchTerm,
+                    questionID: questionID ? questionID : '',
+                },
+                { httpsAgent, auth: this.auth, proxy: false }
+            )
+                .then(result => {
+                    return result.data;
+                })
+                .catch(e => {
+                    console.error(
+                        `astuteSearch - Astute Upstream Failure - ${e.message} for supportedMarket - ${currentSearchTerm} ${questionID}`
+                    );
+                    throw new Error(
+                        `astuteSearch - Astute Upstream Failure - ${e.message} for supportedMarket - ${currentSearchTerm} ${questionID}`
+                    );
+                });
+        }
+    }
+
+    public async sendEmplifiFeedback(
+        sessionID: string,
+        topicId: number,
+        rating: number,
+        comments: string
+    ) {
+        const searchUrl = BRAND_ATTRIBUTES.ford.searchUrl;
+        if (sessionID) {
+            return await HttpService.post(
+                searchUrl.https + '/rating',
+                {
+                    sessionID,
+                    rating: rating,
+                    comment: comments,
+                    intent: topicId,
+                },
+                { httpsAgent, auth: this.auth, proxy: false }
+            )
+                .then(result => {
+                    return result.data;
+                })
+                .catch(e => {
+                    console.error(
+                        `sendEmplifiFeedback - Astute Upstream Failure - ${e.message} for supportedMarket - ${topicId}`
+                    );
+                    throw new Error(
+                        `sendEmplifiFeedback - Astute Upstream Failure - ${e.message} for supportedMarket - ${topicId}`
+                    );
+                });
+        }
+    }
+
+    public async getTopicAttributes(
+        brand: string,
+        topicId: number,
+        languageRegionCode: string
+    ) {
+        const attributesUrl = (BRAND_ATTRIBUTES as any)[brand].attributesUrl;
+        const attributesRequestHeaders = (BRAND_ATTRIBUTES as any)[brand]
+            .attributesRequestHeader;
+        return await HttpService.post(
+            attributesUrl + languageRegionCode + '/search',
+            {
+                filters: [
+                    {
+                        name: 'topicId',
+                        values: [topicId],
+                    },
+                ],
+            },
+            { httpsAgent, proxy: false, headers: attributesRequestHeaders }
+        )
+            .then(result => {
+                return result.data?.responses[0]?.attributes;
+            })
+            .catch((e: { message: any }) => {
+                console.error(
+                    `getTopicAttributes - Astute UpstABCream Failure - ${e.message} for supportedMarket - ${languageRegionCode} and Topic Id - ${topicId}`
+                );
+                throw new Error(
+                    `getTopicAttributes - Astute UpstABCD2ream Failure - ${e.message} for supportedMarket - ${languageRegionCode} and Topic Id - ${topicId}`
+                );
+            });
+    }
+}
